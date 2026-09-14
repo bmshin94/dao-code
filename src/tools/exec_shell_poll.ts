@@ -26,6 +26,11 @@ export const execShellPollTool = defineTool({
   }),
   handler: async (args) => {
     const r = processManager.poll(args.id);
+    // running 且无新输出时给简短提示,避免模型反复 poll 产生"状态:running"刷屏。
+    // 进程完成会自动通知,不需要反复查。
+    if (r.status === "running" && !r.stdout.trim() && !r.stderr.trim()) {
+      return msg("仍在运行(无新输出),完成时会自动通知,无需再 poll。", "Still running (no new output); you'll be notified on completion, no need to poll again.");
+    }
     const parts: string[] = [msg(`状态:${r.status}`, `Status: ${r.status}`)];
     if (r.stdout.trim()) parts.push(r.stdout.trimEnd());
     if (r.stderr.trim()) parts.push(`[stderr]\n${r.stderr.trimEnd()}`);
