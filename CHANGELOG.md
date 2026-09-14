@@ -4,6 +4,27 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-12
+
+### 新增
+- **自定义网关 `/model` 选择器异步拉取列表**:自定义网关(baseUrl 与默认不同)时,
+  `/model` 选择器异步拉取网关 `/models` 接口替换列表;网关列表序号不再限制 1-9。
+
+### 变更
+- **网关模型名归一化计费**:新增 `normalizeModelKey`(小写 + 去 `-joybuilder`/`-local`
+  后缀 + 点转横杠),使网关返回的模型名(如 `Claude-Opus-4.8-joybuilder`)能命中
+  `KNOWN_PRICES`。更新各模型实价表(DeepSeek/Claude/GLM/GPT 按 2026-09 官方价 + 汇率 6.8
+  折算),移除独立的 `USD_PRICES` 表(统一折算后并入 `KNOWN_PRICES`)。
+
+### 修复
+- **识别 SSE 流内 error 事件(如 E2004 max_concurrency 过载)**:brpc 网关(如火山方舟)
+  在 200 响应的 SSE 流里直接返回 `{"error":{"code":"E2004","message":"..."}}`,没有
+  `choices`/`delta`。旧 `processPayload` 只看 `choices[0].delta`、不识别 `error` 字段,
+  静默跳过 → 流式"成功"结束但无产出 → 被当成空响应 → "连续两次空响应,结束本轮"。
+  现在识别后抛出可重试错误,走流式重试(指数退避)。
+- **空响应重试上限从 1 次提到 2 次**(累计 3 次空响应才放弃),给服务端瞬时故障更多
+  恢复机会。
+
 ## [0.5.0] - 2026-08-02
 
 ### 新增

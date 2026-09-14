@@ -50,7 +50,7 @@ describe("runTurn", () => {
     ]);
   });
 
-  it("空 assistant(无内容无工具)先重试一次;连续两次空才不入库、结束(防下一轮 DeepSeek 400)", async () => {
+  it("空 assistant(无内容无工具)先重试;连续 3 次空才不入库、结束(防下一轮 DeepSeek 400)", async () => {
     const s = new Session("SYS", "deepseek-v4-pro");
     s.addUser("hi");
     let calls = 0;
@@ -64,11 +64,11 @@ describe("runTurn", () => {
       executeToolCalls: async () => [],
       write: () => {},
     });
-    expect(calls).toBe(2); // 第一次空响应触发了一次重试,不是立刻放弃
+    expect(calls).toBe(3); // 第一次空响应触发了两次重试,不是立刻放弃
     expect(s.messages).toEqual([
       { role: "system", content: "SYS" },
       { role: "user", content: "hi" },
-    ]); // 两次都空 → 都不入库,结束
+    ]); // 三次都空 → 都不入库,结束
   });
 
   it("空 assistant 重试后拿到真实内容 → 用重试结果,不当成模型主动结束", async () => {
@@ -271,7 +271,7 @@ describe("runTurn", () => {
     expect(maxTokensSeen[1]).toBe(256000); // 重试:直接用加大预算
   });
 
-  it("预算耗尽重试:256000 仍为空 → 结束本轮,不再有第二次机会(不循环)", async () => {
+  it("预算耗尽重试:256000 仍为空 → 结束本轮,不再有第三次机会(不循环)", async () => {
     const s = new Session("SYS", "deepseek-v4-pro");
     s.addUser("hi");
     let call = 0;
@@ -281,7 +281,7 @@ describe("runTurn", () => {
       maxTokensSeen.push(opts.maxTokens);
       opts.onEmptyTruncation?.();
       return (async function* (): AsyncGenerator<StreamDelta, AssistantMessage> {
-        return { role: "assistant", content: "" }; // 两次请求(自然+重试)全部为空
+        return { role: "assistant", content: "" }; // 三次请求(自然+两次重试)全部为空
       })();
     }) as any;
     await runTurn({
@@ -290,8 +290,9 @@ describe("runTurn", () => {
       executeToolCalls: async () => [],
       write: () => {},
     });
-    expect(call).toBe(2); // 自然请求 + 256000 重试,到此为止,不循环翻第二次
+    expect(call).toBe(3); // 自然请求 + 两次 256000 重试,到此为止,不循环翻第三次
     expect(maxTokensSeen[1]).toBe(256000);
+    expect(maxTokensSeen[2]).toBe(256000);
   });
 
   it("服务端不接受 tool_choice → 回退一次普通重试,不让整轮崩掉(火山方舟上是每次都会走到的主路径,非罕见兜底)", async () => {

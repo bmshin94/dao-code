@@ -465,109 +465,113 @@ export async function runTurn(deps: TurnDeps): Promise<void> {
       // "wait,这不对…让我重新想想"那种),最后一轮没能收敛出结论或动作,返回了空响应——
       // 不是真的没有更多要做的了。之前直接 return 会把"没说完"悄悄当成"说完了",且没有
       // 任何可观测的痕迹,一次性/eval 场景下这类情况会被误判成模型"想清楚了但做错了"的
-      // 干净失败,掩盖了真实问题。改成重试一次(不入库这次的空响应,原样重发相同的
+      // 干净失败,掩盖了真实问题。改成重试(不入库这次的空响应,原样重发相同的
       // session.messages);仍是空的才真正结束,但留一条可见提示,不再无声无息消失。
+      // 2026-09 起重试上限从 1 次提到 2 次(累计 3 次空响应才放弃),给 E2004 max_concurrency
+      // 等服务端瞬时故障更多恢复机会。
       if (toolCalls.length === 0 && !hasContent) {
-        // reasoning 耗尽整个输出预算(client.ts 的 onEmptyTruncation)是空响应的一个具体子类:
-        // 原样重发大概率再次把预算耗在同一段思考上(真实撞见过 gpt2-codegolf/
-        // model-extraction-relu-logits 两题,均连续两轮如此、直接终止 session)。这种情况下
-        // 注入一条收敛提示再重试,而不是盲目原样重发。
-        const wasEmptyTruncation = emptyTruncation;
-        if (wasEmptyTruncation) {
-          events.notice("\n[思考耗尽输出预算,提示收敛后重试…]\n");
-          session.messages.push({
-            role: "system",
-            content: "[提示] 上一轮的思考过程用尽了输出预算,还没有给出最终回答或工具调用就被截断。" +
-              "这一轮的回复第一步必须是一次工具调用,不允许先输出任何推导性自由文本——" +
-              "如果是在反复心算/手工推导同一类计算(坐标偏移、字节位置、进制换算等)," +
-              "直接调用 Bash 或 Write 写一个一次性程序把它跑出来,不要在文字里重新推一遍。" +
-              "惯用的脚本语言(如 python)如果在这个环境里不可用,换一种环境里确实存在的" +
-              "语言/编译器(node、perl、awk,或任务本身已保证存在的编译器如 gcc/cc)写," +
-              "目标是自动化而不是固定某一种语言。" +
-              "更根本的是收敛方式:不要试图在文字里把完整方案想清楚、验证过一切分支后再动手——" +
-              "先写一个局部正确、哪怕明知不完整/大概率有 bug 的版本落地,跑起来看真实结果," +
-              "再根据具体反馈小步修正,比继续在脑内推演更完整的方案更接近目标;每一步只解决" +
-              "当前卡住的这一个具体问题,不要在动手前就想着一次性覆盖所有情况。",
-          });
-        } else {
-          events.notice("\n[模型返回空响应,重试一次…]\n");
-        }
-        emptyTruncation = false;
-        // reasoning 耗尽预算这一支,文字提示管不住模型在 reasoning 阶段重新完整推导一遍
-        // (317b130+上面这条结构性提示词复测仍然复现:提示确实注入了,但模型的 reasoning
-        // 本身不受"回复内容"层面的指令约束,重试请求同样把预算耗在心算上,再次空响应)。
-        // 单独调低 reasoning_effort 到"low"复测(regex-chess__wEqpsZA)也不够:探测脚本
-        // 证实"low"在正常场景下确实会让模型更早收敛(completion从16001降到8660),但对
-        // 已经陷入具体反复重算循环的这一次重试,completion两次都精确撞满同一个 max_tokens
-        // 上限——说明 reasoning_effort 只是"目标预算"的软提示,遇到强反模式会被压过去。
-        //
-        // 2026-07-27 复盘推翻了当时基于这个观察做出的第三档(把重试预算压到 6000):
-        //  · 压预算是自我实现的失败——上面这段注释自己记录的探测值就是"low 档自然收敛在
-        //    8660",6000 比它还小,等于保证这次重试也被截断;
-        //  · 文字约束本身没有硬保证——同一份真实 trace 里,模型在撞上限之前(不是作为对
-        //    这条重试提示的反应)调用过 Skill(make-plan) 这类不产出任何东西的元工具,
-        //    说明"愿意先调用工具"和"调用的是能真正推进任务的工具"是两件事,文字管不了
-        //    第二件;
-        //  · 代价被量化了:难度受控的前后对比里,这条死法在本家族从 0% 涨到 48.7%,
-        //    这样收尾的 trial 平均只用掉 32.9% 预算就自杀,丢弃 67.1%。
-        // 现在改成:不再压预算,改用 API 层 tool_choice=required 硬性要求吐出工具调用,并把
-        // 可选工具收敛到能产出/能执行的那几个;第一档仍为空再加大预算强制一次。
-        //
-        // 2026-07-27 五组真实重放(同一决策点,只改请求参数)补充了两点原计划没预料到的现实,
-        // 都不需要改动这段逻辑本身(下面的 catch 兜底和这里的分层设计已经把两者都接住了),
-        // 但会改变"这条修复到底靠什么起效"的因果叙述,记录下来避免以后误判:
-        //  · tool_choice=required 在火山方舟(ARK,当前评测实际在用的 provider)被直接 400 拒绝
-        //    ——直接探测确认 auto/none 都是 200,required 和具名函数强制都是 400,与
-        //    parallel_tool_calls 无关,是网关的 API 面限制。同一个请求打 DeepSeek 原生 API
-        //    (api.deepseek.com)则 200 通过、真吐出工具调用——机制本身没问题,卡在网关这层。
-        //    也就是说在 ARK 上,下面的 forced 分支【每次都会走进 catch】,真正生效的其实是
-        //    "加大预算+退回原始全量工具集"这条兜底路径,不是 tool_choice 本身;这条兜底路径
-        //    单独真实测过命中率(小样本,n=3~5)比旧的 6000+无强制基线明显更高。
-        //  · 收窄工具集(forcedTools)在网关不校验 tool_calls 是否落在本次请求 tools 数组内时
-        //    不是硬约束:补测过"不强制但收窄"这一档,模型仍然吐出了不在当次 tools 数组里的
-        //    TodoWrite(5 个样本里 3 个)——根源是系统提示词的叙事文本(messages[0],不受
-        //    某一次请求 tools 数组收窄的约束)明确写着"多步任务转成 TodoWrite 清单",模型
-        //    凭这段记忆调用,网关未拦截。工具集收窄在这类网关上是软偏置,不是可信赖的防线。
-        // 2026-07-28 真实复测(write-compressor,两次独立trial)推翻了"先在默认预算重试一次,
-        // 仍空再加大"这个两档设计:两次真实数据里,第一档(维持默认预算)重试都【同样撞满】,
-        // 各自白白搭进去约200-280秒才轮到加大预算那一档;而加大预算那次,完成时只用了
-        // 7668/4329 token——远低于基线上限,不是"给多少用多少"。这说明"先按兵不动
-        // 试一次默认预算"这个中间档从未兑现过(理论依据是"low档可能自然收敛在更短",但两次
-        // 真实观测里都没发生),而"给更大空间"也没有让模型输出更啰嗦——直接铺开预算反而收敛
-        // 更快。故只保留一次重试,直接用 ESCALATED_MAX_TOKENS,不再分两档;2026-08-01 基线
-        // 预算本身再翻倍到 128000 后,重试档(256000)也只此一档,不再叠加第二档——基线已经
-        // 够大,不需要"重试档=2×基线"之外再留一层"重试档的重试档"。
-        if (wasEmptyTruncation) {
-          const forced = tools.filter((tl) => FORCED_TOOLS.has(tl.function.name));
-          const forcedTools = forced.length > 0 ? forced : tools;
-          // tool_choice 此前在 src/ 里零使用。被拒时必须退回普通重试——否则异常直接上抛、
-          // 整个会话崩掉,比修复前更糟(这条兜底在火山方舟上不是"以防万一",是每次真实评测
-          // 都会走到的主路径,见上方说明)。
-          let forcingUnsupported = false;
-          const attempt = async (maxTokensOverride?: number): Promise<AssistantMessage> => {
-            if (!forcingUnsupported) {
-              try {
-                return await requestAssistant(forcedTools, t, "low", maxTokensOverride, true);
-              } catch (e) {
-                if (signal?.aborted) throw e;
-                forcingUnsupported = true;
-                events.notice("\n[服务端不接受强制工具调用,回退成普通重试…]\n");
+        const MAX_EMPTY_RETRIES = Number(process.env.DAO_EMPTY_MAX_RETRIES) || 2;
+        let emptyRetries = 0;
+        let wasEmptyTruncation = emptyTruncation;
+        while (toolCalls.length === 0 && !hasContent && emptyRetries < MAX_EMPTY_RETRIES) {
+          if (wasEmptyTruncation) {
+            events.notice("\n[思考耗尽输出预算,提示收敛后重试…]\n");
+            session.messages.push({
+              role: "system",
+              content: "[提示] 上一轮的思考过程用尽了输出预算,还没有给出最终回答或工具调用就被截断。" +
+                "这一轮的回复第一步必须是一次工具调用,不允许先输出任何推导性自由文本——" +
+                "如果是在反复心算/手工推导同一类计算(坐标偏移、字节位置、进制换算等)," +
+                "直接调用 Bash 或 Write 写一个一次性程序把它跑出来,不要在文字里重新推一遍。" +
+                "惯用的脚本语言(如 python)如果在这个环境里不可用,换一种环境里确实存在的" +
+                "语言/编译器(node、perl、awk,或任务本身已保证存在的编译器如 gcc/cc)写," +
+                "目标是自动化而不是固定某一种语言。" +
+                "更根本的是收敛方式:不要试图在文字里把完整方案想清楚、验证过一切分支后再动手——" +
+                "先写一个局部正确、哪怕明知不完整/大概率有 bug 的版本落地,跑起来看真实结果," +
+                "再根据具体反馈小步修正,比继续在脑内推演更完整的方案更接近目标;每一步只解决" +
+                "当前卡住的这一个具体问题,不要在动手前就想着一次性覆盖所有情况。",
+            });
+          } else {
+            events.notice(`\n[模型返回空响应,重试(${emptyRetries + 1}/${MAX_EMPTY_RETRIES})…]\n`);
+          }
+          emptyTruncation = false;
+          // reasoning 耗尽预算这一支,文字提示管不住模型在 reasoning 阶段重新完整推导一遍
+          // (317b130+上面这条结构性提示词复测仍然复现:提示确实注入了,但模型的 reasoning
+          // 本身不受"回复内容"层面的指令约束,重试请求同样把预算耗在心算上,再次空响应)。
+          // 单独调低 reasoning_effort 到"low"复测(regex-chess__wEqpsZA)也不够:探测脚本
+          // 证实"low"在正常场景下确实会让模型更早收敛(completion从16001降到8660),但对
+          // 已经陷入具体反复重算循环的这一次重试,completion两次都精确撞满同一个 max_tokens
+          // 上限——说明 reasoning_effort 只是"目标预算"的软提示,遇到强反模式会被压过去。
+          //
+          // 2026-07-27 复盘推翻了当时基于这个观察做出的第三档(把重试预算压到 6000):
+          //  · 压预算是自我实现的失败——上面这段注释自己记录的探测值就是"low 档自然收敛在
+          //    8660",6000 比它还小,等于保证这次重试也被截断;
+          //  · 文字约束本身没有硬保证——同一份真实 trace 里,模型在撞上限之前(不是作为对
+          //    这条重试提示的反应)调用过 Skill(make-plan) 这类不产出任何东西的元工具,
+          //    说明"愿意先调用工具"和"调用的是能真正推进任务的工具"是两件事,文字管不了
+          //    第二件;
+          //  · 代价被量化了:难度受控的前后对比里,这条死法在本家族从 0% 涨到 48.7%,
+          //    这样收尾的 trial 平均只用掉 32.9% 预算就自杀,丢弃 67.1%。
+          // 现在改成:不再压预算,改用 API 层 tool_choice=required 硬性要求吐出工具调用,并把
+          // 可选工具收敛到能产出/能执行的那几个;第一档仍为空再加大预算强制一次。
+          //
+          // 2026-07-27 五组真实重放(同一决策点,只改请求参数)补充了两点原计划没预料到的现实,
+          // 都不需要改动这段逻辑本身(下面的 catch 兜底和这里的分层设计已经把两者都接住了),
+          // 但会改变"这条修复到底靠什么起效"的因果叙述,记录下来避免以后误判:
+          //  · tool_choice=required 在火山方舟(ARK,当前评测实际在用的 provider)被直接 400 拒绝
+          //    ——直接探测确认 auto/none 都是 200,required 和具名函数强制都是 400,与
+          //    parallel_tool_calls 无关,是网关的 API 面限制。同一个请求打 DeepSeek 原生 API
+          //    (api.deepseek.com)则 200 通过、真吐出工具调用——机制本身没问题,卡在网关这层。
+          //    也就是说在 ARK 上,下面的 forced 分支【每次都会走进 catch】,真正生效的其实是
+          //    "加大预算+退回原始全量工具集"这条兜底路径,不是 tool_choice 本身;这条兜底路径
+          //    单独真实测过命中率(小样本,n=3~5)比旧的 6000+无强制基线明显更高。
+          //  · 收窄工具集(forcedTools)在网关不校验 tool_calls 是否落在本次请求 tools 数组内时
+          //    不是硬约束:补测过"不强制但收窄"这一档,模型仍然吐出了不在当次 tools 数组里的
+          //    TodoWrite(5 个样本里 3 个)——根源是系统提示词的叙事文本(messages[0],不受
+          //    某一次请求 tools 数组收窄的约束)明确写着"多步任务转成 TodoWrite 清单",模型
+          //    凭这段记忆调用,网关未拦截。工具集收窄在这类网关上是软偏置,不是可信赖的防线。
+          // 2026-07-28 真实复测(write-compressor,两次独立trial)推翻了"先在默认预算重试一次,
+          //  仍空再加大"这个两档设计:两次真实数据里,第一档(维持默认预算)重试都【同样撞满】,
+          //  各自白白搭进去约200-280秒才轮到加大预算那一档;而加大预算那次,完成时只用了
+          //  7668/4329 token——远低于基线上限,不是"给多少用多少"。这说明"先按兵不动
+          //  试一次默认预算"这个中间档从未兑现过(理论依据是"low档可能自然收敛在更短",但两次
+          //  真实观测里都没发生),而"给更大空间"也没有让模型输出更啰嗦——直接铺开预算反而收敛
+          //  更快。故只保留一次重试,直接用 ESCALATED_MAX_TOKENS,不再分两档;2026-08-01 基线
+          //  预算本身再翻倍到 128000 后,重试档(256000)也只此一档,不再叠加第二档——基线已经
+          //  够大,不需要"重试档=2×基线"之外再留一层"重试档的重试档"。
+          if (wasEmptyTruncation) {
+            const forced = tools.filter((tl) => FORCED_TOOLS.has(tl.function.name));
+            const forcedTools = forced.length > 0 ? forced : tools;
+            // tool_choice 此前在 src/ 里零使用。被拒时必须退回普通重试——否则异常直接上抛、
+            // 整个会话崩掉,比修复前更糟(这条兜底在火山方舟上不是"以防万一",是每次真实评测
+            // 都会走到的主路径,见上方说明)。
+            let forcingUnsupported = false;
+            const attempt = async (maxTokensOverride?: number): Promise<AssistantMessage> => {
+              if (!forcingUnsupported) {
+                try {
+                  return await requestAssistant(forcedTools, t, "low", maxTokensOverride, true);
+                } catch (e) {
+                  if (signal?.aborted) throw e;
+                  forcingUnsupported = true;
+                  events.notice("\n[服务端不接受强制工具调用,回退成普通重试…]\n");
+                }
               }
-            }
-            return await requestAssistant(tools, t, "low", maxTokensOverride);
-          };
-          assistant = await attempt(ESCALATED_MAX_TOKENS);
-          toolCalls = assistant.tool_calls ?? [];
-          hasContent = typeof assistant.content === "string" && assistant.content.trim().length > 0;
-        } else {
-          assistant = await requestAssistant(tools, t);
-          toolCalls = assistant.tool_calls ?? [];
-          hasContent = typeof assistant.content === "string" && assistant.content.trim().length > 0;
+              return await requestAssistant(tools, t, "low", maxTokensOverride);
+            };
+            assistant = await attempt(ESCALATED_MAX_TOKENS);
+            toolCalls = assistant.tool_calls ?? [];
+            hasContent = typeof assistant.content === "string" && assistant.content.trim().length > 0;
+          } else {
+            assistant = await requestAssistant(tools, t);
+            toolCalls = assistant.tool_calls ?? [];
+            hasContent = typeof assistant.content === "string" && assistant.content.trim().length > 0;
+          }
+          emptyRetries++;
+          wasEmptyTruncation = emptyTruncation;
         }
         if (toolCalls.length === 0 && !hasContent) {
           events.notice(wasEmptyTruncation
             ? "\n[强制工具调用+加大预算后仍是空响应,结束本轮]\n"
-            : "\n[连续两次空响应,结束本轮]\n");
+            : `\n[连续 ${emptyRetries + 1} 次空响应,结束本轮]\n`);
           return;
         }
       }
