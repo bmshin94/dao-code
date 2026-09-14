@@ -3,6 +3,10 @@ import { defineTool } from "./types.js";
 import { processManager } from "./process_manager.js";
 import { msg } from "./lang.js";
 
+// 节流:记录每个后台进程最近一次"running 且无新输出"的 poll 时间,
+// 30 秒内再 poll 同一进程且仍无输出时直接挡回,避免模型反复 poll 刷屏。
+const lastPollAt = new Map<string, number>();
+
 export const execShellPollTool = defineTool({
   name: "BashOutput",
   description: "读取某个后台进程(Bash 的 background=true 启动的)自上次轮询以来的【新增】输出与当前状态" +
@@ -26,11 +30,20 @@ export const execShellPollTool = defineTool({
   }),
   handler: async (args) => {
     const r = processManager.poll(args.id);
-    // running 且无新输出时给简短提示,避免模型反复 poll 产生"状态:running"刷屏。
-    // 进程完成会自动通知,不需要反复查。
+    // running 且无新输出时,用节流阻止模型反复 poll 刷屏:
+    // 第一次给提示"仍在运行,完成自动通知,勿再 poll";
+    // 30 秒内再 poll 同一进程且仍无输出,直接挡回"刚查过,等自动通知"。
+    // 30 秒后冷却重置,允许一次正常 checkpoint。
     if (r.status === "running" && !r.stdout.trim() && !r.stderr.trim()) {
-      return msg("仍在运行(无新输出),完成时会自动通知,无需再 poll。", "Still running (no new output); you'll be notified on completion, no need to poll again.");
+      const now = Date.now();
+      const last = lastPollAt.get(args.id) ?? 0;
+      lastPollAt.set(args.id, now);
+      if (now - last < 30_000) {
+        return msg("刚查过(不到 30s),无新输出,等自动通知,勿再 poll。", "Just polled (<30s ago), no new output, wait for auto-notification, don't poll again.");
+      }
+      return msg("仍在运行,完成自动通知,勿再 poll。", "Still running, you'll be notified on completion, don't poll again.");
     }
+    lastPollAt.delete(args.id);
     const parts: string[] = [msg(`状态:${r.status}`, `Status: ${r.status}`)];
     if (r.stdout.trim()) parts.push(r.stdout.trimEnd());
     if (r.stderr.trim()) parts.push(`[stderr]\n${r.stderr.trimEnd()}`);
