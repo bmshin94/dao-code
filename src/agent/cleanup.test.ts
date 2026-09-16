@@ -6,10 +6,29 @@ import path from "node:path";
 import { cleanup, maybeCleanup } from "./cleanup.js";
 import { createWorktree } from "./worktree.js";
 
+// afterEach 里 fs.rm(root) 在 macOS 上偶尔和 git 后台 gc/文件句柄竞态报 ENOTEMPTY
+// (git worktree remove 后 .git/refs、.git/objects 等目录可能还有后台句柄未释放)。
+// 加有限重试:遇到 ENOTEMPTY/EBUSY 退避后重试,规避 flaky。
+async function rmWithRetry(target: string, retries = 5): Promise<void> {
+  for (let i = 0; i < retries; i++) {
+    try {
+      await fs.rm(target, { recursive: true, force: true });
+      return;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if ((code === "ENOTEMPTY" || code === "EBUSY") && i < retries - 1) {
+        await new Promise((r) => setTimeout(r, 50 * (i + 1)));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 let root: string;
 const NOW = 1_900_000_000_000; // 固定时间戳(避免依赖 Date.now)
 beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), "dao-clean-")); });
-afterEach(async () => { await fs.rm(root, { recursive: true, force: true }); });
+afterEach(async () => { await rmWithRetry(root); });
 
 async function mk(rel: string, ageDays: number) {
   const p = path.join(root, rel);

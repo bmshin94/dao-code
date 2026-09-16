@@ -261,7 +261,7 @@ export const enTips: string[] = [
   "Big tasks: /goal <goal> drives autonomously; when large enough it orchestrates subagents in research→synthesize→implement→verify phases",
   "/batch splits a big change across parallel worktree subagents, each on its own branch",
   "/loop 5m <thing> runs periodically in-session; dao schedule runs it on local cron",
-  "Shift+Tab cycles permission modes: default (ask before write/exec) → smart decision ⊙ (AI risk assessment) → full grant ※ (no approval)",
+  "Shift+Tab cycles permission modes: smart decision ⊙ (AI risk assessment) ↔ full grant ※ (no approval)",
   "/bypass full grant, no approvals (careful); deny rules and dangerous commands (rm -rf /…) still block you",
   "dao remembers automatically; /remember <thing> notes one manually, /memory shows the user/knowledge/project layers",
   "/effort tunes thinking depth (low/medium/high/max); /cost shows usage and cache hit rate",

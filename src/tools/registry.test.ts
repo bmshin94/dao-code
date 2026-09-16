@@ -71,6 +71,47 @@ describe("ToolRegistry", () => {
     reg.register(makeEcho());
     await expect(reg.dispatch("echo", '{"text":123}', { workspaceRoot: "/tmp" })).rejects.toThrow();
   });
+
+  it("缺必填字段 + 传了错误参数名(记串)→ 提示点出传了什么、工具要什么", async () => {
+    // 真实撞见(20260916-154427-ebx2):模型把 Glob 的 `glob` 写成 `pattern`(和 Grep 记串),
+    // zod 报原始 JSON 数组,模型要自己解析才知道哪错了。优化后应直接点出"你传了 pattern,但工具不含 glob"。
+    const reg = new ToolRegistry();
+    reg.register(defineTool({
+      name: "Glob",
+      description: "search files",
+      capability: "read", approval: "auto",
+      schema: z.object({
+        glob: z.string().describe("文件名/路径 glob"),
+        path: z.string().optional().describe("搜索子目录"),
+      }),
+      handler: async () => "",
+    }));
+    await expect(reg.dispatch("Glob", '{"pattern": "**/*.ts"}', { workspaceRoot: "/tmp" })).rejects.toThrow(
+      /Glob 缺少必填参数「glob」.*你传了 \[pattern\].*参数名可能写错了.*Glob 接受的参数.*glob\(string, 必填/s,
+    );
+  });
+
+  it("缺必填字段 + 没传任何参数 → 提示缺哪个字段、工具要什么", async () => {
+    const reg = new ToolRegistry();
+    reg.register(defineTool({
+      name: "Read",
+      description: "read file",
+      capability: "read", approval: "auto",
+      schema: z.object({ path: z.string().describe("文件路径") }),
+      handler: async () => "",
+    }));
+    await expect(reg.dispatch("Read", "{}", { workspaceRoot: "/tmp" })).rejects.toThrow(
+      /Read 缺少必填参数「path」.*Read 需要参数「path」.*但你没传任何参数.*Read 接受的参数.*path\(string, 必填/s,
+    );
+  });
+
+  it("类型不对(传 number 但要 string)→ 提示期望/实际类型", async () => {
+    const reg = new ToolRegistry();
+    reg.register(makeEcho());
+    await expect(reg.dispatch("echo", '{"text":123}', { workspaceRoot: "/tmp" })).rejects.toThrow(
+      /echo 参数「text」需要 string,收到 number.*echo 接受的参数.*text\(string, 必填/s,
+    );
+  });
 });
 
 describe("ToolRegistry descriptionEn", () => {

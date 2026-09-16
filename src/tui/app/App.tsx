@@ -951,7 +951,7 @@ export function App(deps: AppDeps) {
       exitArmedTimer.current = setTimeout(() => setExitArmed(false), 2000);
       return;
     }
-    // Shift+Tab:循环权限模式(默认 → 智能判定 → 全权放行,三档循环),随时可用。
+    // Shift+Tab:循环权限模式(智能判定 → 全权放行,两档循环),随时可用。
     if (key.tab && key.shift && deps.cycleMode) {
       const m = deps.cycleMode();
       setStatus(deps.getStatus());

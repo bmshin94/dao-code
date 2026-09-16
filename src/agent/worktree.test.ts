@@ -6,6 +6,25 @@ import os from "node:os";
 import path from "node:path";
 import { createWorktree } from "./worktree.js";
 
+// afterEach 里 fs.rm(repo) 在 macOS 上偶尔和 git 后台 gc/文件句柄竞态报 ENOTEMPTY
+// (git worktree remove 后 .git/objects/pack 等目录可能还有后台句柄未释放)。
+// 加有限重试:遇到 ENOTEMPTY/EBUSY 退避后重试,规避 flaky。
+async function rmWithRetry(target: string, retries = 5): Promise<void> {
+  for (let i = 0; i < retries; i++) {
+    try {
+      await fs.rm(target, { recursive: true, force: true });
+      return;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if ((code === "ENOTEMPTY" || code === "EBUSY") && i < retries - 1) {
+        await new Promise((r) => setTimeout(r, 50 * (i + 1)));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 let repo: string;
 const git = (args: string[], cwd: string) => execFileSync("git", args, { cwd, stdio: "ignore" });
 
@@ -18,13 +37,13 @@ beforeEach(async () => {
   git(["add", "."], repo);
   git(["commit", "-m", "init"], repo);
 });
-afterEach(async () => { await fs.rm(repo, { recursive: true, force: true }); });
+afterEach(async () => { await rmWithRetry(repo); });
 
 describe("createWorktree", () => {
   it("非 git 目录 → null", async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "dao-nogit-"));
     expect(createWorktree(tmp, "x")).toBeNull();
-    await fs.rm(tmp, { recursive: true, force: true });
+    await rmWithRetry(tmp);
   });
 
   it("建 worktree;hasChanges 反映工作树状态;cleanup 移除", () => {
